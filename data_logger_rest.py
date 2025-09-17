@@ -29,7 +29,7 @@ from websocket import WebSocketApp
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QPushButton, QLabel, QTextEdit
+    QPushButton, QLabel, QTextEdit, QFileDialog
 )
 from PyQt5.QtCore import QObject, pyqtSignal, QTimer
 
@@ -215,6 +215,15 @@ class KiwoomWSClient(QObject):
         self._items = items[:]
         self._types = types[:]
 
+    def apply_subscription(self) -> None:
+        if self.ws and self._connected:
+            try:
+                self._send_reg()
+            except Exception as e:
+                self.status.emit(f"REG 전송 실패: {e}")
+        else:
+            self.status.emit("WS 연결 후 구독이 적용됩니다.")
+
     # ----- WS callbacks -----
     def _on_open(self, *_):
         self._connected = True
@@ -228,10 +237,12 @@ class KiwoomWSClient(QObject):
 
     def _on_close(self, *_):
         self._connected = False
+        self._reg_sent = False
         self.connected.emit(False)
         self.status.emit("WS closed")
 
     def _on_error(self, *_):
+        self._reg_sent = False
         self.status.emit("WS error"); logging.exception("WebSocket error")
 
     def _on_message(self, _, message: str):
@@ -280,6 +291,7 @@ class KiwoomWSClient(QObject):
             }]
         }
         self.ws.send(json.dumps(frame))
+        self._reg_sent = True
         self.status.emit(f"REG sent: items={self._items} types={self._types}")
 
     def _map_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,6 +343,8 @@ class DataLoggerGUI(QMainWindow):
         self.parquet   = ParquetBuffer(BUFFER_SIZE, OUTPUT_DIR)
 
         self._logging_active = False
+        self.ticker_file_path: Optional[str] = None
+        self._active_items: List[str] = SUBSCRIBE_ITEMS[:]
 
         cw = QWidget(); self.setCentralWidget(cw)
         layout = QVBoxLayout(cw)
@@ -342,10 +356,16 @@ class DataLoggerGUI(QMainWindow):
 
         row = QHBoxLayout()
         self.btn_connect = QPushButton("연결(토큰→WS)")
+        self.btn_file = QPushButton("티커 파일 선택")
         self.btn_start   = QPushButton("로깅 시작")
         self.btn_stop    = QPushButton("로깅 중지")
-        row.addWidget(self.btn_connect); row.addWidget(self.btn_start); row.addWidget(self.btn_stop)
+        row.addWidget(self.btn_connect); row.addWidget(self.btn_file); row.addWidget(self.btn_start); row.addWidget(self.btn_stop)
         layout.addLayout(row)
+
+        self.lbl_file = QLabel("선택된 파일: (없음)")
+        self.lbl_items = QLabel(self._format_items_label(self._active_items))
+        layout.addWidget(self.lbl_file)
+        layout.addWidget(self.lbl_items)
 
         layout.addWidget(QLabel("로그:"))
         self.log_box = QTextEdit(); self.log_box.setReadOnly(True); self.log_box.setMaximumHeight(320)
@@ -353,6 +373,7 @@ class DataLoggerGUI(QMainWindow):
 
         # Signals
         self.btn_connect.clicked.connect(self._connect)
+        self.btn_file.clicked.connect(self._select_file)
         self.btn_start.clicked.connect(self._start)
         self.btn_stop.clicked.connect(self._stop)
         self.ws_client.connected.connect(self._on_ws_connected)
@@ -368,6 +389,75 @@ class DataLoggerGUI(QMainWindow):
         self.log_box.append(f"[{t}] {msg}")
         sb = self.log_box.verticalScrollBar(); sb.setValue(sb.maximum())
 
+    def _format_items_label(self, items: List[str]) -> str:
+        count = len(items)
+        if not count:
+            return "구독 종목: (없음)"
+        preview = ", ".join(items[:5])
+        if count > 5:
+            preview += ", ..."
+        return f"구독 종목: {count}개 ({preview})"
+
+    def _select_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "티커 엑셀 파일 선택",
+            str(Path.cwd()),
+            "Excel Files (*.xlsx *.xls);;All Files (*)",
+        )
+        if path:
+            self.ticker_file_path = path
+            self.lbl_file.setText(f"선택된 파일: {Path(path).name}")
+            self._log(f"티커 파일 선택: {path}")
+
+    def _load_tickers_from_excel(self, path: str) -> List[str]:
+        df = pd.read_excel(path)
+        if df.empty:
+            raise ValueError("엑셀 파일에 데이터가 없습니다.")
+
+        preferred = [
+            "ticker", "tickers", "symbol", "symbols", "code", "codes",
+            "종목코드", "티커"
+        ]
+        column_map = {str(col).strip().lower(): col for col in df.columns}
+        target_col: Optional[str] = None
+        for name in preferred:
+            key = name.lower()
+            if key in column_map:
+                target_col = column_map[key]
+                break
+        if target_col is None:
+            for col in df.columns:
+                raw_name = str(col).strip()
+                if raw_name in preferred:
+                    target_col = col
+                    break
+        if target_col is None:
+            target_col = df.columns[0]
+
+        series = df[target_col]
+        items: List[str] = []
+        for raw in series.dropna():
+            value: Any = raw
+            if isinstance(value, float):
+                if pd.isna(value):
+                    continue
+                if value.is_integer():
+                    value = int(value)
+            if isinstance(value, int) and not isinstance(value, bool):
+                item = f"{value:06d}"
+            else:
+                text = str(value).strip()
+                if not text:
+                    continue
+                if text.endswith(".0") and text.replace(".", "", 1).isdigit():
+                    text = text[:-2]
+                item = text.zfill(6) if text.isdigit() else text
+            if item and item not in items:
+                items.append(item)
+
+        return items
+
     # Actions
     def _connect(self):
         try:
@@ -378,10 +468,26 @@ class DataLoggerGUI(QMainWindow):
             self._log(f"연결 실패: {e}")
 
     def _start(self):
-        # If you need per-항목 items/symbols, set them here.
-        # Example for symbols-based feeds: self.ws_client.set_subscription(["005930","000660"], ["<add-type>"])
+        items = SUBSCRIBE_ITEMS[:]
+        if self.ticker_file_path:
+            try:
+                loaded = self._load_tickers_from_excel(self.ticker_file_path)
+                if loaded:
+                    items = loaded
+                    preview = ", ".join(items[:5]) + (", ..." if len(items) > 5 else "")
+                    self._log(f"엑셀에서 {len(items)}개 종목 로드: {preview}")
+                else:
+                    self._log("엑셀 파일에서 유효한 종목코드를 찾지 못했습니다. 기본 설정을 사용합니다.")
+            except Exception as e:
+                self._log(f"엑셀 파일 읽기 실패: {e}. 기본 설정을 사용합니다.")
+
+        self._active_items = items
+        self.lbl_items.setText(self._format_items_label(items))
+        self.ws_client.set_subscription(items, SUBSCRIBE_TYPES)
+        self.ws_client.apply_subscription()
         self._logging_active = True
-        self._log(f"로깅 시작 (types={SUBSCRIBE_TYPES}, items={SUBSCRIBE_ITEMS})")
+        preview = ", ".join(items[:5]) + (", ..." if len(items) > 5 else "") if items else "(없음)"
+        self._log(f"로깅 시작 (types={SUBSCRIBE_TYPES}, items={preview})")
 
     def _stop(self):
         self._logging_active = False
