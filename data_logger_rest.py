@@ -59,7 +59,8 @@ WS_URL = "wss://api.kiwoom.com:10000/api/dostk/websocket"
 # For symbols-based feeds, set SUBSCRIBE_ITEMS to a list of 종목코드 strings.
 SUBSCRIBE_GROUP   = "1"
 SUBSCRIBE_REFRESH = "1"
-SUBSCRIBE_TYPES   = ["00"]   # add more types if needed (e.g., 체결/호가 codes)
+# Default to 실시간 종목 체결(0B) + 호가잔량(0D) so trade/호가 정보가 모두 수신됩니다.
+SUBSCRIBE_TYPES   = ["0B", "0D"]
 SUBSCRIBE_ITEMS   = [""]     # "" per Kiwoom sample for 00(주문체결). Put "005930" etc. when required.
 
 OUTPUT_DIR         = "./data"
@@ -214,6 +215,16 @@ class KiwoomWSClient(QObject):
     def set_subscription(self, items: List[str], types: List[str]) -> None:
         self._items = items[:]
         self._types = types[:]
+        self._reg_sent = False
+
+    def apply_subscription(self) -> None:
+        if self.ws and self._connected:
+            try:
+                self._send_reg()
+            except Exception as e:
+                self.status.emit(f"REG 전송 실패: {e}")
+        else:
+            self.status.emit("WS 연결 후 구독이 적용됩니다.")
 
     def apply_subscription(self) -> None:
         if self.ws and self._connected:
@@ -287,7 +298,7 @@ class KiwoomWSClient(QObject):
             "refresh": SUBSCRIBE_REFRESH,
             "data": [{
                 "item":  self._items,   # e.g., ["005930", ...] or [""] for 00
-                "type":  self._types,   # e.g., ["00"] now; add more when needed
+                "type":  self._types,   # e.g., ["0B", "0D"] 기본; 필요 시 다른 실시간 타입 추가
             }]
         }
         self.ws.send(json.dumps(frame))
@@ -295,40 +306,106 @@ class KiwoomWSClient(QObject):
         self.status.emit(f"REG sent: items={self._items} types={self._types}")
 
     def _map_message(self, msg: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Generic mapper: keep your fid_* schema.
-        For now we try common keys if present; always store raw payload too.
-        Update these mappings once you confirm each 실시간 항목's field names.
-        """
+        """Normalize Kiwoom 실시간 응답을 fid_* 스키마로 정리합니다."""
+
+        def _merge_body(container: Any, out: Dict[str, Any]) -> None:
+            if not container:
+                return
+            if isinstance(container, dict):
+                keys = set(container.keys())
+                if "fid" in keys and "value" in keys:
+                    out[str(container.get("fid"))] = container.get("value")
+                    return
+                if "key" in keys and "value" in keys:
+                    out[str(container.get("key"))] = container.get("value")
+                    return
+                if "field" in keys and "data" in keys:
+                    out[str(container.get("field"))] = container.get("data")
+                    return
+                if "name" in keys and "value" in keys:
+                    out[str(container.get("name"))] = container.get("value")
+                    return
+                for k, v in container.items():
+                    if isinstance(v, (dict, list)):
+                        _merge_body(v, out)
+                    else:
+                        out[str(k)] = v
+            elif isinstance(container, list):
+                for entry in container:
+                    if isinstance(entry, dict):
+                        _merge_body(entry, out)
+                    else:
+                        out[str(entry)] = entry
+
+        body_map: Dict[str, Any] = {}
+        for key in ("body", "msgBody", "msg_body", "output", "output1", "rt_data"):
+            _merge_body(msg.get(key), body_map)
+
         now = datetime.now().isoformat()
-        # Common guess keys (adjust when you have the exact spec)
-        symbol = msg.get("symbol") or msg.get("code") or msg.get("sym") or ""
-        price  = msg.get("price")  or msg.get("tp")   or msg.get("현재가") or ""
-        change = msg.get("change") or msg.get("cp")   or msg.get("전일대비") or ""
-        pct    = msg.get("pct")    or msg.get("rp")   or msg.get("등락률") or ""
-        qty    = msg.get("qty")    or msg.get("tqty") or msg.get("체결량") or ""
-        tvol   = msg.get("tvol")   or msg.get("vol")  or msg.get("누적거래량") or ""
-        ask1   = msg.get("ask1")   or msg.get("aq1")  or msg.get("매도호가1") or ""
-        bid1   = msg.get("bid1")   or msg.get("bq1")  or msg.get("매수호가1") or ""
-        av1    = msg.get("ask1_qty") or msg.get("av1") or msg.get("매도호가수량1") or ""
-        bv1    = msg.get("bid1_qty") or msg.get("bv1") or msg.get("매수호가수량1") or ""
+        trnm = str(msg.get("trnm", "")).upper()
 
-        return {
-            "timestamp": now,
-            "trnm": msg.get("trnm", ""),
-            "symbol": str(symbol).zfill(6) if str(symbol).isdigit() else str(symbol),
-            "fid_10": str(price),
-            "fid_11": str(change),
-            "fid_12": str(pct),
-            "fid_27": str(qty),
-            "fid_28": str(tvol),
-            "fid_41": str(ask1),
-            "fid_51": str(bid1),
-            "fid_61": str(av1),
-            "fid_71": str(bv1),
-            "raw": json.dumps(msg, ensure_ascii=False),
+        def _pick(*candidates: Any) -> str:
+            for cand in candidates:
+                if cand is None:
+                    continue
+                key = str(cand)
+                if key in body_map and body_map[key] not in (None, ""):
+                    return str(body_map[key])
+                if key in msg and msg[key] not in (None, ""):
+                    return str(msg[key])
+            return ""
+
+        symbol_candidates = [
+            msg.get("tr_key"),
+            msg.get("symbol"),
+            msg.get("code"),
+            body_map.get("tr_key"),
+            body_map.get("symbol"),
+            body_map.get("code"),
+            body_map.get("종목코드"),
+            body_map.get("stck_shrn_iscd"),
+        ]
+        symbol = next((s for s in symbol_candidates if s), "")
+        if isinstance(symbol, (int, float)) and not isinstance(symbol, bool):
+            symbol = f"{int(symbol):06d}"
+        else:
+            symbol = str(symbol).strip()
+            symbol = symbol.zfill(6) if symbol.isdigit() else symbol
+
+        record: Dict[str, Any] = {
+            "trnm": trnm,
+            "symbol": symbol,
         }
+        base_fids = ["10", "11", "12", "13", "15", "27", "28"]
+        for fid in base_fids:
+            record[f"fid_{fid}"] = _pick(fid)
 
+        # Top 10 price levels (공통 호가)
+        for fid in list(range(41, 61)) + list(range(61, 81)):
+            record[f"fid_{fid}"] = _pick(fid)
+
+        # 거래소별 호가 잔량(KRX/NXT)
+        for fid in range(6044, 6054):
+            record[f"fid_{fid}"] = _pick(fid)
+        for fid in range(6054, 6064):
+            record[f"fid_{fid}"] = _pick(fid)
+        for fid in range(6066, 6076):
+            record[f"fid_{fid}"] = _pick(fid)
+        for fid in range(6076, 6086):
+            record[f"fid_{fid}"] = _pick(fid)
+
+        # Allow direct Korean-name fallbacks for 주요 항목
+        if not record.get("fid_10"):
+            record["fid_10"] = _pick("현재가", "stck_prpr")
+        if not record.get("fid_12"):
+            record["fid_12"] = _pick("등락률", "prdy_ctrt")
+        if not record.get("fid_13"):
+            record["fid_13"] = _pick("누적거래량", "acml_vol")
+        if not record.get("fid_15"):
+            record["fid_15"] = _pick("체결량", "cntg_vol")
+
+        record["raw"] = json.dumps(msg, ensure_ascii=False)
+        return record
 # -----------------------------------------------------------------------------
 # GUI
 # -----------------------------------------------------------------------------
